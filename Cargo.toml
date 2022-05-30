@@ -2,10 +2,10 @@
 resolver = "2"
 members = [
   "yamux",
-  "secio",
-  "multiaddr",
-  "tentacle",
-  "bench",
+#  "secio",
+#  "multiaddr",
+#  "tentacle",
+#  "bench",
 ]
 exclude = [
   "protocols/discovery",

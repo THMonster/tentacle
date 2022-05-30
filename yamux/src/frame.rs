@@ -27,6 +27,7 @@ impl Frame {
                 flags,
                 stream_id,
                 length: body.len() as u32,
+                frame_id: 0,
             },
             body: Some(body),
         }
@@ -41,6 +42,7 @@ impl Frame {
                 flags,
                 stream_id,
                 length: delta,
+                frame_id: 0,
             },
             body: None,
         }
@@ -55,6 +57,7 @@ impl Frame {
                 flags,
                 stream_id: RESERVED_STREAM_ID,
                 length: ping_id,
+                frame_id: 0,
             },
             body: None,
         }
@@ -69,6 +72,22 @@ impl Frame {
                 flags: Flags::default(),
                 stream_id: RESERVED_STREAM_ID,
                 length: reason as u32,
+                frame_id: 0,
+            },
+            body: None,
+        }
+    }
+
+    /// Create a close low level stream frame
+    pub fn new_close_stream() -> Frame {
+        Frame {
+            header: Header {
+                version: PROTOCOL_VERSION,
+                ty: Type::CloseStream,
+                flags: Flags::default(),
+                stream_id: RESERVED_STREAM_ID,
+                length: 0,
+                frame_id: 0,
             },
             body: None,
         }
@@ -82,6 +101,16 @@ impl Frame {
     /// The stream id of current frame
     pub fn stream_id(&self) -> StreamId {
         self.header.stream_id
+    }
+
+    /// The frame id of current frame
+    pub fn frame_id(&self) -> StreamId {
+        self.header.frame_id
+    }
+
+    /// The frame id of current frame
+    pub fn set_frame_id(&mut self, fid: StreamId) {
+        self.header.frame_id = fid;
     }
 
     /// The flags of current frame
@@ -116,6 +145,7 @@ pub struct Header {
     ty: Type,
     flags: Flags,
     stream_id: StreamId,
+    frame_id: StreamId,
     length: u32,
 }
 
@@ -138,6 +168,9 @@ pub enum Type {
 
     /// Used to close a session.
     GoAway = 0x3,
+
+    /// Used to close a low level stream.
+    CloseStream = 0x4,
 }
 
 impl Type {
@@ -147,6 +180,7 @@ impl Type {
             0x1 => Some(Type::WindowUpdate),
             0x2 => Some(Type::Ping),
             0x3 => Some(Type::GoAway),
+            0x4 => Some(Type::CloseStream),
             _ => None,
         }
     }
@@ -293,6 +327,7 @@ impl Decoder for FrameCodec {
                 let flags = Flags(header_data.get_u16());
                 let stream_id = header_data.get_u32();
                 let length = header_data.get_u32();
+                let frame_id = header_data.get_u32();
                 if ty == Type::Data && length > self.max_frame_size {
                     let err = io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -306,6 +341,7 @@ impl Decoder for FrameCodec {
                     flags,
                     stream_id,
                     length,
+                    frame_id,
                 }
             }
             None => {
@@ -343,6 +379,7 @@ impl Encoder<Frame> for FrameCodec {
         dst.put_u16(header.flags.value());
         dst.put_u32(header.stream_id);
         dst.put_u32(header.length);
+        dst.put_u32(header.frame_id);
         if let Some(data) = body {
             dst.put(data);
         }

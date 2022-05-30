@@ -26,6 +26,7 @@ use crate::{
     control::{Command, Control},
     error::Error,
     frame::{Flag, Flags, Frame, FrameCodec, GoAwayCode, Type},
+    framed_stream::{FSState, FramedStream},
     stream::{StreamEvent, StreamHandle, StreamState},
     StreamId,
 };
@@ -45,7 +46,7 @@ static mut TIME: Instant = Instant::from_u64(0);
 /// The session
 pub struct Session<T> {
     // Framed low level raw stream
-    framed_stream: Framed<T, FrameCodec>,
+    // framed_stream: Framed<T, FrameCodec>,
 
     // Got EOF from low level raw stream
     eof: bool,
@@ -105,10 +106,16 @@ pub struct Session<T> {
     event_receiver: UnboundedReceiver<StreamEvent>,
 
     /// use to async open stream/close session
-    control_sender: Sender<Command>,
-    control_receiver: Receiver<Command>,
+    control_sender: Sender<Command<T>>,
+    control_receiver: Receiver<Command<T>>,
 
     keepalive: Option<Interval>,
+
+    next_read_frame_id: StreamId,
+    next_write_frame_id: StreamId,
+
+    framed_streams: VecDeque<FramedStream<T>>,
+    max_stream_window_size: u32,
 }
 
 /// Session type, client or server
@@ -145,10 +152,12 @@ where
         };
         let (event_sender, event_receiver) = unbounded();
         let (control_sender, control_receiver) = channel(32);
-        let framed_stream = Framed::new(
-            raw_stream,
-            FrameCodec::default().max_frame_size(config.max_stream_window_size),
-        );
+        // let framed_stream = Framed::new(
+        //     raw_stream,
+        //     FrameCodec::default().max_frame_size(config.max_stream_window_size),
+        // );
+        let mut framed_streams = VecDeque::default();
+        framed_streams.push_front(FramedStream::new(raw_stream, config.max_stream_window_size));
         let keepalive = if config.enable_keepalive {
             Some(interval(config.keepalive_interval))
         } else {
@@ -156,7 +165,7 @@ where
         };
 
         Session {
-            framed_stream,
+            // framed_stream,
             eof: false,
             remote_go_away: false,
             local_go_away: false,
@@ -174,6 +183,10 @@ where
             control_sender,
             control_receiver,
             keepalive,
+            next_read_frame_id: 1,
+            next_write_frame_id: 1,
+            framed_streams,
+            max_stream_window_size: config.max_stream_window_size,
         }
     }
 
@@ -263,7 +276,7 @@ where
     }
 
     /// Return a control to async open stream/close session
-    pub fn control(&self) -> Control {
+    pub fn control(&self) -> Control<T> {
         Control::new(self.control_sender.clone())
     }
 
@@ -327,19 +340,26 @@ where
                 break;
             }
 
-            let mut sink = Pin::new(&mut self.framed_stream);
-
-            match sink.as_mut().poll_ready(cx)? {
-                Poll::Ready(()) => {
-                    sink.as_mut().start_send(frame)?;
+            let mut frame = Some(frame);
+            for fs in self.framed_streams.iter_mut() {
+                if fs.state != FSState::Established {
+                    continue;
                 }
-                Poll::Pending => {
-                    debug!("[{:?}] framed_stream NotReady, frame: {:?}", self.ty, frame);
-                    self.write_pending_frames.push_front(frame);
-
-                    if self.poll_complete(cx)? {
-                        return Ok(true);
+                let mut sink = Pin::new(&mut fs.inner);
+                match sink.as_mut().poll_ready(cx)? {
+                    Poll::Ready(()) => {
+                        sink.as_mut().start_send(frame.take().unwrap())?;
+                        break;
                     }
+                    Poll::Pending => {}
+                }
+            }
+            if let Some(frame) = frame {
+                debug!("[{:?}] framed_stream NotReady, frame: {:?}", self.ty, frame);
+                self.write_pending_frames.push_front(frame);
+
+                if self.poll_complete(cx)? {
+                    return Ok(true);
                 }
             }
         }
@@ -353,13 +373,29 @@ where
     /// Sink `poll_complete` Ready -> no buffer remain, flush all
     /// Sink `poll_complete` NotReady -> there is more work left to do, may wake up next poll
     fn poll_complete(&mut self, cx: &mut Context) -> Result<bool, io::Error> {
-        match Pin::new(&mut self.framed_stream).poll_flush(cx) {
-            Poll::Pending => Ok(true),
-            Poll::Ready(res) => res.map(|_| false),
+        let mut has_ready = false;
+        for fs in self.framed_streams.iter_mut() {
+            if fs.state != FSState::Established {
+                continue;
+            }
+            match Pin::new(&mut fs.inner).poll_flush(cx) {
+                Poll::Pending => {}
+                Poll::Ready(res) => {
+                    res?;
+                    has_ready = true;
+                }
+            }
+        }
+        if has_ready {
+            Ok(false)
+        } else {
+            Ok(true)
         }
     }
 
-    fn send_frame(&mut self, cx: &mut Context, frame: Frame) -> Result<(), io::Error> {
+    fn send_frame(&mut self, cx: &mut Context, mut frame: Frame) -> Result<(), io::Error> {
+        frame.set_frame_id(self.next_write_frame_id);
+        self.next_write_frame_id = self.next_write_frame_id.wrapping_add(1);
         self.write_pending_frames.push_back(frame);
         if self.send_all(cx)? {
             debug!("[{:?}] Session::send_frame() finished", self.ty);
@@ -378,6 +414,7 @@ where
             Type::GoAway => {
                 self.handle_go_away(cx, &frame)?;
             }
+            _ => {}
         }
         Ok(())
     }
@@ -432,7 +469,9 @@ where
                     debug!("substream({}) closed, session.ty={:?}", stream_id, self.ty);
                     let mut flags = Flags::from(Flag::Ack);
                     flags.add(Flag::Rst);
-                    let frame = Frame::new_window_update(flags, stream_id, 0);
+                    let mut frame = Frame::new_window_update(flags, stream_id, 0);
+                    frame.set_frame_id(self.next_write_frame_id);
+                    self.next_write_frame_id = self.next_write_frame_id.wrapping_add(1);
                     self.write_pending_frames.push_back(frame);
                 }
             }
@@ -530,23 +569,62 @@ where
     // Receive frames from low level stream
     fn recv_frames(&mut self, cx: &mut Context) -> Poll<Option<Result<(), io::Error>>> {
         trace!("[{:?}] poll from framed_stream", self.ty);
-        match Pin::new(&mut self.framed_stream).as_mut().poll_next(cx) {
-            Poll::Ready(Some(Ok(frame))) => {
-                self.handle_frame(cx, frame)?;
-                Poll::Ready(Some(Ok(())))
+        let mut has_ready = false;
+        for i in 0..self.framed_streams.len() {
+            // for fs in self.framed_streams.iter_mut() {
+            let fs = self.framed_streams.get_mut(i).unwrap();
+            match fs.pending_frame.take() {
+                Some(frame) => {
+                    if frame.frame_id() == self.next_read_frame_id {
+                        self.handle_frame(cx, frame)?;
+                        self.next_read_frame_id = self.next_read_frame_id.wrapping_add(1);
+                        has_ready = true;
+                    } else {
+                        fs.pending_frame = Some(frame);
+                    }
+                }
+                None => {
+                    match Pin::new(&mut fs.inner).as_mut().poll_next(cx) {
+                        Poll::Ready(Some(Ok(frame))) => {
+                            if frame.ty() == Type::CloseStream {
+                                if fs.state == FSState::Established {
+                                    fs.state = FSState::RemoteClosed;
+                                } else {
+                                    fs.state = FSState::Closed;
+                                }
+                            } else {
+                                if frame.frame_id() == self.next_read_frame_id {
+                                    self.handle_frame(cx, frame)?;
+                                    self.next_read_frame_id =
+                                        self.next_read_frame_id.wrapping_add(1);
+                                } else {
+                                    fs.pending_frame = Some(frame);
+                                }
+                            }
+                            has_ready = true;
+                        }
+                        Poll::Ready(None) => {
+                            self.eof = true;
+                            // Poll::Ready(None)
+                        }
+                        Poll::Pending => {
+                            trace!("[{:?}] poll framed_stream NotReady", self.ty);
+                            // Poll::Pending
+                        }
+                        Poll::Ready(Some(Err(err))) => {
+                            debug!("[{:?}] Session recv_frames error: {:?}", self.ty, err);
+                            return Poll::Ready(Some(Err(err)));
+                        }
+                    };
+                }
             }
-            Poll::Ready(None) => {
-                self.eof = true;
-                Poll::Ready(None)
-            }
-            Poll::Pending => {
-                trace!("[{:?}] poll framed_stream NotReady", self.ty);
-                Poll::Pending
-            }
-            Poll::Ready(Some(Err(err))) => {
-                debug!("[{:?}] Session recv_frames error: {:?}", self.ty, err);
-                Poll::Ready(Some(Err(err)))
-            }
+        }
+        if has_ready {
+            Poll::Ready(Some(Ok(())))
+        } else if self.eof == true {
+            Poll::Ready(None)
+        } else {
+            Poll::Pending
         }
     }
 
@@ -583,6 +661,45 @@ where
     }
 
     fn control_poll(&mut self, cx: &mut Context) -> Poll<Option<Result<(), io::Error>>> {
+        let mut to_remove = None;
+        for (i, fs) in self.framed_streams.iter_mut().enumerate() {
+            if fs.state == FSState::LocalClosing || fs.state == FSState::RemoteClosed {
+                let mut sink = Pin::new(&mut fs.inner);
+                match sink.as_mut().poll_ready(cx)? {
+                    Poll::Ready(()) => {
+                        sink.as_mut().start_send(Frame::new_close_stream())?;
+                        if fs.state == FSState::LocalClosing {
+                            fs.state = FSState::LocalClosingHalf;
+                        } else {
+                            fs.state = FSState::RemoteClosedLocalClosing;
+                        }
+                    }
+                    Poll::Pending => {}
+                }
+            }
+            if fs.state == FSState::LocalClosingHalf
+                || fs.state == FSState::RemoteClosedLocalClosing
+            {
+                match Pin::new(&mut fs.inner).poll_flush(cx) {
+                    Poll::Pending => {}
+                    Poll::Ready(res) => {
+                        res?;
+                        if fs.state == FSState::LocalClosingHalf {
+                            fs.state = FSState::LocalClosed;
+                        } else {
+                            fs.state = FSState::Closed;
+                        }
+                    }
+                }
+            }
+            if fs.state == FSState::Closed {
+                to_remove = Some(i);
+            }
+        }
+        if let Some(it) = to_remove {
+            let _ = self.framed_streams.remove(it);
+        }
+
         match Pin::new(&mut self.control_receiver).as_mut().poll_next(cx) {
             Poll::Ready(Some(event)) => {
                 match event {
@@ -593,6 +710,20 @@ where
                         self.shutdown(cx)?;
                         let _ignore = tx.send(());
                     }
+                    Command::AddStream(it) => {
+                        self.framed_streams
+                            .push_front(FramedStream::new(it, self.max_stream_window_size));
+                    }
+                    Command::CloseOldestStream => {
+                        if let Some(fs) = self.framed_streams.back_mut() {
+                            if fs.state == FSState::Established {
+                                fs.state = FSState::LocalClosing;
+                            }
+                        }
+                    }
+                    Command::GetStreamsNum(tx) => {
+                        let _ignore = tx.send(self.framed_streams.len());
+                    },
                 }
                 Poll::Ready(Some(Ok(())))
             }
