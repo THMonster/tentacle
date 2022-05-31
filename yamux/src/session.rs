@@ -116,6 +116,7 @@ pub struct Session<T> {
 
     framed_streams: VecDeque<FramedStream<T>>,
     max_stream_window_size: u32,
+    flipper: bool,
 }
 
 /// Session type, client or server
@@ -187,6 +188,7 @@ where
             next_write_frame_id: 1,
             framed_streams,
             max_stream_window_size: config.max_stream_window_size,
+            flipper: true,
         }
     }
 
@@ -341,19 +343,37 @@ where
             }
 
             let mut frame = Some(frame);
-            for fs in self.framed_streams.iter_mut() {
-                if fs.state != FSState::Established {
-                    continue;
-                }
-                let mut sink = Pin::new(&mut fs.inner);
-                match sink.as_mut().poll_ready(cx)? {
-                    Poll::Ready(()) => {
-                        sink.as_mut().start_send(frame.take().unwrap())?;
-                        break;
+            if self.flipper {
+                for fs in self.framed_streams.iter_mut() {
+                    if fs.state != FSState::Established {
+                        continue;
                     }
-                    Poll::Pending => {}
+                    let mut sink = Pin::new(&mut fs.inner);
+                    match sink.as_mut().poll_ready(cx)? {
+                        Poll::Ready(()) => {
+                            sink.as_mut().start_send(frame.take().unwrap())?;
+                            break;
+                        }
+                        Poll::Pending => {}
+                    }
+                }
+            } else {
+                for fs in self.framed_streams.iter_mut().rev() {
+                    if fs.state != FSState::Established {
+                        continue;
+                    }
+                    let mut sink = Pin::new(&mut fs.inner);
+                    match sink.as_mut().poll_ready(cx)? {
+                        Poll::Ready(()) => {
+                            sink.as_mut().start_send(frame.take().unwrap())?;
+                            break;
+                        }
+                        Poll::Pending => {}
+                    }
                 }
             }
+            self.flipper = self.flipper ^ true;
+
             if let Some(frame) = frame {
                 debug!("[{:?}] framed_stream NotReady, frame: {:?}", self.ty, frame);
                 self.write_pending_frames.push_front(frame);
@@ -723,7 +743,7 @@ where
                     }
                     Command::GetStreamsNum(tx) => {
                         let _ignore = tx.send(self.framed_streams.len());
-                    },
+                    }
                 }
                 Poll::Ready(Some(Ok(())))
             }
