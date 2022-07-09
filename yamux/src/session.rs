@@ -19,13 +19,13 @@ use futures::{
 use log::{debug, log_enabled, trace};
 use nohash_hasher::IntMap;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio_util::codec::Framed;
+// use tokio_util::codec::Framed;
 
 use crate::{
     config::Config,
     control::{Command, Control},
     error::Error,
-    frame::{Flag, Flags, Frame, FrameCodec, GoAwayCode, Type},
+    frame::{Flag, Flags, Frame, GoAwayCode, Type},
     framed_stream::{FSState, FramedStream},
     stream::{StreamEvent, StreamHandle, StreamState},
     StreamId,
